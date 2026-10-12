@@ -64,6 +64,22 @@ export function canDropAt(
     return { allowDrop: true };
 }
 
+/**
+ * A block that moves only with its container: one that starts inside a
+ * callout other than itself, or inside a list item's subtree unless it is a
+ * list item of that item's quote depth (`- item\n    > - q` is a quoted child).
+ * The engine cannot rewrite a quote prefix or a non-list indentation.
+ */
+export function isNestedBlock(doc: Doc, block: Block, options: { lineMap: LineMap; tabSize: number }): boolean {
+    const start = block.lines.startLine;
+    if (start > 1 && calloutCovers(doc, start - 1, start, options)) return true;
+    const { lineMeta } = options.lineMap;
+    const item = listItemContaining(options.lineMap, start, 0);
+    return (
+        item !== null && (block.type !== BlockType.ListItem || lineMeta[item].quoteDepth !== lineMeta[start].quoteDepth)
+    );
+}
+
 /** Whether one callout, starting at or above `top`, reaches down to `bottom`. */
 export function calloutCovers(
     doc: Doc,
