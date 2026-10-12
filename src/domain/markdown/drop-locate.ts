@@ -1,7 +1,7 @@
 import { detectBlock } from '../block/block-detector';
 import { type Block, BlockType } from '../block/block-types';
-import type { DropPosition } from '../command/drop-position';
-import { planMove } from '../move/move-plan';
+import type { DropPosition, DropZone } from '../command/drop-position';
+import { effectiveZone, planMove } from '../move/move-plan';
 import { parseLine } from '../parse/parse-line';
 import type { RejectReason } from '../result';
 import { canDropAt } from '../rules/container-policy';
@@ -10,13 +10,14 @@ import { selectionLineRanges } from '../selection/block-selection';
 import { type CapturedMoveSource, captureMoveSource } from '../transaction/move-blocks';
 import type { Doc } from './document-types';
 import { canonicalSeam, gapAt } from './gap';
-import { getLineMap, getLineMetaAt, listLineAtOrAbove, quoteRunAt } from './line-map';
+import { getLineMap, getLineMetaAt, type LineMap, listLineAtOrAbove, quoteRunAt } from './line-map';
 import { isLineNumberInRanges } from './line-range';
 import type { LineRange } from './line-range-types';
 
 /**
  * Drop locate — two independent axes, no cross-null:
- *   y → insert-before seam line (always), canonicalised to its gap's seam
+ *   y → insert-before seam line (always), canonicalised to its gap's seam,
+ *       and the zone of the gap the pointer is over (DropZone)
  *   x → target indent → parent at that seam (clamp to structure, never kills y)
  */
 export type DropLocateInput = {
@@ -32,31 +33,56 @@ export type DropLocateInput = {
 };
 
 export function locateDropPosition(input: DropLocateInput): DropPosition {
-    const { doc, selection, hitLine, belowMid, sourceIndentWidth, targetIndentWidth, tabSize, indentUnit } = input;
-
+    const { doc, hitLine, belowMid, tabSize } = input;
     const lineMap = getLineMap(doc, { tabSize });
     const line = canonicalSeam(doc, belowMid ? hitLine + 1 : hitLine, { lineMap });
+    return locateAt(input, line, pointerZone(lineMap, hitLine, belowMid));
+}
+
+/**
+ * The part of the gap the pointer is over: the lower half of the line above
+ * the gap, the upper half of the line below it, or anywhere between (its
+ * blank lines, or padding at an edge).
+ */
+function pointerZone(lineMap: LineMap, hitLine: number, belowMid: boolean): DropZone {
+    if (hitLine < 1 || hitLine > lineMap.doc.lines || lineMap.lineMeta[hitLine].isEmpty) return 'apart';
+    return belowMid ? 'joinAbove' : 'joinBelow';
+}
+
+/** The drop position at a canonical seam: its parent from the x axis, and the zone it takes for this payload. */
+function locateAt(input: DropLocateInput, line: number, zone: DropZone | undefined): DropPosition {
+    const { doc, selection, tabSize } = input;
+    const lineMap = getLineMap(doc, { tabSize });
+    const sourceDoc = input.sourceDoc ?? doc;
+    const captured = captureMoveSource(sourceDoc, selection, { lineMap: getLineMap(sourceDoc, { tabSize }), tabSize });
+    const at = gapAt(doc, line, { lineMap, tabSize });
+    const moving = (other: number) =>
+        sourceDoc === doc &&
+        captured !== null &&
+        captured.segments.some((s) => other >= s.startLine && other <= s.endLine);
+    const parent = dropParent(input, line, lineMap);
+    const zoneFor = (payload: CapturedMoveSource) =>
+        effectiveZone(doc, at.type === 'gap' ? at.gap : null, { zone, parent }, payload, { lineMap, tabSize, moving });
+    return { doc, line, parent, zone: captured ? zoneFor(captured) : undefined };
+}
+
+function dropParent(input: DropLocateInput, line: number, lineMap: LineMap): Block | null {
+    const { doc, selection, sourceIndentWidth, targetIndentWidth, tabSize, indentUnit } = input;
 
     // x cannot veto y: root seam is always valid.
-    if (indentUnit <= 0 || line <= 1) {
-        return { doc, line, parent: null };
-    }
+    if (indentUnit <= 0 || line <= 1) return null;
 
     // One drop may nest freely, but can outdent by at most one level.
     const want = Math.max(
         quantizeIndent(targetIndentWidth, indentUnit),
         quantizeIndent(sourceIndentWidth, indentUnit) - indentUnit,
     );
-    if (want <= 0) {
-        return { doc, line, parent: null };
-    }
+    if (want <= 0) return null;
 
     // The last non-blank line above the seam: nesting works across a loose list's blank line.
     const above = lineMap.prevNonEmpty[line - 1];
     let parentLine = above > 0 ? listLineAtOrAbove(lineMap, above) : null;
-    if (parentLine === null || lineMap.listSubtreeEndLine[parentLine] < above) {
-        return { doc, line, parent: null };
-    }
+    if (parentLine === null || lineMap.listSubtreeEndLine[parentLine] < above) return null;
 
     // Child indent `want` needs parent indent `want - unit`.
     // Walk up until indent ≤ desired; skip self-selection in the same document.
@@ -69,9 +95,7 @@ export function locateDropPosition(input: DropLocateInput): DropPosition {
     const depth = parseLine((input.sourceDoc ?? doc).line(first).text, tabSize).quote.depth;
     if (depth > 0) {
         const run = quoteRunAt(lineMap, above);
-        if (!sameDoc || above !== line - 1 || first < run.startLine || first > run.endLine) {
-            return { doc, line, parent: null };
-        }
+        if (!sameDoc || above !== line - 1 || first < run.startLine || first > run.endLine) return null;
     }
 
     while (parentLine > 0) {
@@ -91,12 +115,7 @@ export function locateDropPosition(input: DropLocateInput): DropPosition {
         break;
     }
 
-    if (parentLine <= 0) {
-        return { doc, line, parent: null };
-    }
-
-    const parent = listItemAt(doc, parentLine, tabSize);
-    return { doc, line, parent };
+    return parentLine > 0 ? listItemAt(doc, parentLine, tabSize) : null;
 }
 
 function quantizeIndent(width: number, indentUnit: number): number {
@@ -108,6 +127,27 @@ function listItemAt(doc: Doc, listHeadLine: number, tabSize: number): Block | nu
     const block = detectBlock(doc, listHeadLine, { tabSize });
     if (!block || block.type !== BlockType.ListItem) return null;
     return block;
+}
+
+/**
+ * The row the drop indicator sits on, and which edge of it: the bottom of the
+ * line above for `joinAbove`, the top of the line below for `joinBelow`, the
+ * middle of the gap's blank lines for a line payload `apart`, and
+ * otherwise the seam — above the first line, or below the previous line.
+ */
+export function seamRow(position: DropPosition): { row: number; edge: 'top' | 'below' | 'center' } {
+    const { doc, line, zone } = position;
+    let above = line - 1;
+    while (above >= 1 && doc.line(above).text.trim().length === 0) above--;
+    if (zone === 'joinAbove') return { row: above, edge: 'below' };
+    if (zone === 'joinBelow') return { row: line, edge: 'top' };
+    const blanks = Math.min(line, doc.lines + 1) - above - 1;
+    if (zone === 'apart' && blanks > 0) {
+        return blanks % 2 === 1
+            ? { row: above + (blanks + 1) / 2, edge: 'center' }
+            : { row: above + blanks / 2, edge: 'below' };
+    }
+    return line <= 1 ? { row: 1, edge: 'top' } : { row: Math.min(line - 1, doc.lines), edge: 'below' };
 }
 
 /**
@@ -187,17 +227,22 @@ export function snapDrop(input: SnapDropInput): DropPosition {
         (a, b) => Math.abs(a - raw.line) - Math.abs(b - raw.line) || b - a,
     );
     for (const line of edges) {
-        const position = locateDropPosition({
-            doc,
-            sourceDoc,
-            selection,
-            hitLine: line,
-            belowMid: false,
-            sourceIndentWidth,
-            targetIndentWidth,
-            tabSize,
-            indentUnit,
-        });
+        // A snapped seam is not where the pointer is: it lands apart. A position without a zone keeps none.
+        const position = locateAt(
+            {
+                doc,
+                sourceDoc,
+                selection,
+                hitLine: line,
+                belowMid: false,
+                sourceIndentWidth,
+                targetIndentWidth,
+                tabSize,
+                indentUnit,
+            },
+            canonicalSeam(doc, line, { lineMap: getLineMap(doc, { tabSize }) }),
+            raw.zone && 'apart',
+        );
         const planned = plan(position);
         if (planned.type === 'ok' || NO_SNAP_REASONS.has(planned.reason)) return position;
     }

@@ -78,7 +78,12 @@ export function captureMoveSource(
     const end = (line: number, block: Block): PayloadEnd => {
         const facing = detectBlock(doc, line, options);
         if (!facing) throw new Error(`md-dragger: no block at payload line ${line}`);
-        return { type: facing.type, run: runKind(doc, line, options), standalone: standalone(line, block) };
+        return {
+            type: facing.type,
+            run: runKind(doc, line, options),
+            standalone: standalone(line, block),
+            selected: block.type,
+        };
     };
     return {
         blocks,
@@ -147,6 +152,7 @@ export function moveTx(params: { sourceDoc: Doc; plan: MovePlan }): DocEdit[] | 
                 const run = quoteRunAt(targetLineMap, line);
                 return run.startLine <= first && first <= run.endLine;
             },
+            zone: plan.position.zone,
         });
         const inserted = compileDocEdit(targetDoc, [insertion], parse);
         return plan.mode === 'copy' ? [inserted] : [inserted, compileDocEdit(sourceDoc, removals, parse)];
@@ -212,7 +218,14 @@ function insertAfterRemoval(
         const first = plan.captured.segments[0].startLine;
         return run.startLine <= first && first <= run.endLine;
     };
-    const insertion = insertIntoGap(removed, at.gap, payload, { lineMap, tabSize, parent, standalone, fromQuote });
+    const insertion = insertIntoGap(removed, at.gap, payload, {
+        lineMap,
+        tabSize,
+        parent,
+        standalone,
+        fromQuote,
+        zone: plan.position.zone,
+    });
 
     const pos = offsetBeforeRemoval(deletions, insertion.from);
     return { from: pos, to: pos, insert: insertion.insert };
@@ -432,7 +445,7 @@ function lastContentLine(text: string): string {
 }
 
 /** Apply non-overlapping TextChanges to a doc and return the resulting text. */
-function applyChanges(doc: Doc, changes: TextChange[]): string {
+export function applyChanges(doc: Doc, changes: TextChange[]): string {
     let out = '';
     let pos = 0;
     for (const c of [...changes].sort((a, b) => a.from - b.from)) {

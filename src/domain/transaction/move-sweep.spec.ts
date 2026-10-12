@@ -7,6 +7,7 @@ import { locateDropPosition } from '../markdown/drop-locate';
 import { getLineMap, listItemContaining } from '../markdown/line-map';
 import { mergeLineRanges } from '../markdown/line-range';
 import { planMove } from '../move/move-plan';
+import { isLinePayloadEnd } from '../mutation';
 import { parseLine } from '../parse/parse-line';
 import { facingAt, needsBlankLine, runKind } from '../rules/separation';
 import { selectBlocks } from '../selection/block-selection';
@@ -42,6 +43,7 @@ const PAGES: Record<string, string> = {
     nested: '- a\n    - a1\n    - a2\n\n- b\n\n- c\n\n1. o\n\n    1. o1\n\n    2. o2\n2. p\n',
     quoted: '> [!todo] Today\n> - buy milk\n> - call mom\n\n- a\n- b\n\npara\n\n1. one\n2. two\n\n> - q1\n> - q2\n\n- x\n- y\n- z\n\nend',
     headings: '# A\nalpha\n# B\nbeta\n## C\n> qa\n## D\n> qb\n> qc\n## E\ngamma\ndelta\n\nepsilon\nzeta\n\n> qd',
+    deep: 'x\n\n> > a\n> > b\n\n# H\n> [!note] t\n> > q\n\ntail',
 };
 
 /** Pages whose lists are swept with every pair of blocks at every nesting level too. */
@@ -304,6 +306,18 @@ function without(all: string[], removed: string[]): string[] {
     return rest.sort();
 }
 
+function lastNonBlank(lines: string[], from: number): number {
+    let i = from;
+    while (i >= 0 && !lines[i].trim()) i--;
+    return i;
+}
+
+function firstNonBlank(lines: string[], from: number): number {
+    let i = from;
+    while (i < lines.length && !lines[i].trim()) i++;
+    return i;
+}
+
 /** Line of each normalised non-blank text (lines are unique within a page). */
 function lineOfText(doc: Doc): Map<string, number> {
     const at = new Map<string, number>();
@@ -486,6 +500,20 @@ function sweepMove(
         );
         if (start < 0 && !allowIndent) problems.push('not in the indicated gap');
 
+        // A line payload lands where its zone says: tight to the line it joins, or apart in a gap with blank lines.
+        const { zone } = planned.value.position;
+        if (start >= 0 && zone !== undefined) {
+            const blanksAbove = start - 1 - lastNonBlank(outLines, start - 1);
+            const blanksBelow = firstNonBlank(outLines, start + payload.length) - (start + payload.length);
+            if (zone === 'joinAbove' && blanksAbove !== 0) problems.push('joinAbove not joined');
+            if (zone === 'joinBelow' && blanksBelow !== 0) problems.push('joinBelow not joined');
+            if (zone === 'apart' && (gap.blankLines > 0 || !gap.above || !gap.below)) {
+                if (isLinePayloadEnd(captured.first) && expectedAbove !== null && blanksAbove === 0)
+                    problems.push('apart joined above');
+                if (isLinePayloadEnd(captured.last) && expectedBelow !== null && blanksBelow === 0)
+                    problems.push('apart joined below');
+            }
+        }
         problems.push(
             ...splitParagraphs(doc, outDoc, captured.segments),
             ...relooseLists(doc, outDoc, captured.segments),
@@ -534,6 +562,22 @@ const byPointer =
             indentUnit,
         });
     };
+
+/** A drop where the pointer is: over the upper or lower half of `hitLine` (below the last line past the end). */
+const byPointerHalf =
+    (hitLine: number, belowMid: boolean) =>
+    (doc: Doc, selection: ReturnType<typeof selectBlocks>): DropPosition =>
+        locateDropPosition({
+            doc,
+            sourceDoc: doc,
+            selection,
+            hitLine,
+            belowMid: hitLine > doc.lines || belowMid,
+            sourceIndentWidth: 0,
+            targetIndentWidth: 0,
+            tabSize,
+            indentUnit,
+        });
 
 function sweepCross(
     names: string,
@@ -663,6 +707,32 @@ describe('moveTx invariant sweep', () => {
             }
             expect(outcome.problems).toEqual([]);
             expect(outcome.ok).toBeGreaterThan(5);
+        },
+    );
+
+    it.each(Object.entries(PAGES))(
+        'moves every block of the %s page where the pointer puts it, in every zone',
+        (name, text) => {
+            const doc = stringDoc(text);
+            const outcome: Outcome = { ok: 0, problems: [] };
+            for (const start of blockStarts(doc)) {
+                // Only a paragraph or quote line takes a zone: the join under the pointer, or apart.
+                const block = detectBlock(doc, start, { tabSize }) as Block;
+                const line = block.type === BlockType.Paragraph || block.type === BlockType.Blockquote;
+                for (let hitLine = 1; hitLine <= doc.lines + 1; hitLine++) {
+                    const blank = hitLine > doc.lines || doc.line(hitLine).text.trim().length === 0;
+                    for (const belowMid of [false, true]) {
+                        const { zone } = byPointerHalf(hitLine, belowMid)(doc, selectBlocks([block]));
+                        const pointer = blank ? 'apart' : belowMid ? 'joinAbove' : 'joinBelow';
+                        if (line ? zone !== undefined && zone !== 'apart' && zone !== pointer : zone !== undefined) {
+                            outcome.problems.push(`${name} [${start}] over ${hitLine}${belowMid ? '↓' : '↑'}: ${zone}`);
+                        }
+                        sweepMove(name, text, [start], byPointerHalf(hitLine, belowMid), outcome);
+                    }
+                }
+            }
+            expect(outcome.problems).toEqual([]);
+            expect(outcome.ok).toBeGreaterThan(20);
         },
     );
 
