@@ -60,13 +60,18 @@ function locateAt(input: DropLocateInput, line: number, zone: DropZone | undefin
         sourceDoc === doc &&
         captured !== null &&
         captured.segments.some((s) => other >= s.startLine && other <= s.endLine);
-    const parent = dropParent(input, line, lineMap);
+    const parent = dropParent(input, line, lineMap, captured);
     const zoneFor = (payload: CapturedMoveSource) =>
         effectiveZone(doc, at.type === 'gap' ? at.gap : null, { zone, parent }, payload, { lineMap, tabSize, moving });
     return { doc, line, parent, zone: captured ? zoneFor(captured) : undefined };
 }
 
-function dropParent(input: DropLocateInput, line: number, lineMap: LineMap): Block | null {
+function dropParent(
+    input: DropLocateInput,
+    line: number,
+    lineMap: LineMap,
+    captured: CapturedMoveSource | null,
+): Block | null {
     const { doc, selection, sourceIndentWidth, targetIndentWidth, tabSize, indentUnit } = input;
 
     // x cannot veto y: root seam is always valid.
@@ -90,12 +95,27 @@ function dropParent(input: DropLocateInput, line: number, lineMap: LineMap): Blo
     const sameDoc = input.sourceDoc === undefined || input.sourceDoc === doc;
     const sourceLines = sameDoc ? selectionLineRanges(doc.lines, selection) : [];
     // The engine writes no `>` prefix: a parent is an item of the payload's own quote depth, and a quoted parent
-    // only in the quote the payload moves within, directly above the seam: any other quote stays apart from it.
+    // only in the quote the payload moves within, directly above the seam, and not when the payload ends the quote:
+    // a blank line before a quoted line, or any line outside the quote before a later selected block of its depth.
+    // Any other quote stays apart from it.
     const first = selection.blocks[0].lines.startLine;
     const depth = parseLine((input.sourceDoc ?? doc).line(first).text, tabSize).quote.depth;
     if (depth > 0) {
         const run = quoteRunAt(lineMap, above);
-        if (!sameDoc || above !== line - 1 || first < run.startLine || first > run.endLine) return null;
+        const lineDepth = (text: string) => parseLine(text, tabSize).quote.depth;
+        const quoteEnds =
+            captured !== null &&
+            (/\n[ \t]*\n[ \t]*>/.test(captured.content) ||
+                captured.starts.some(
+                    (at, i) =>
+                        i > 0 &&
+                        lineDepth(captured.content.slice(at).split('\n', 1)[0]) >= depth &&
+                        captured.content
+                            .slice(0, at - 1)
+                            .split('\n')
+                            .some((line) => lineDepth(line) < depth),
+                ));
+        if (!sameDoc || above !== line - 1 || quoteEnds || first < run.startLine || first > run.endLine) return null;
     }
 
     while (parentLine > 0) {
